@@ -60,85 +60,147 @@ impl OpenVpnProvider for NordVPN {
         let country_map = crate::util::country_map::code_to_country_map();
         create_dir_all(&openvpn_dir)?;
         delete_all_files_in_dir(&openvpn_dir)?;
-        let url = "https://downloads.nordcdn.com/configs/archives/servers/ovpn.zip";
+
+        let mut source_url = "https://downloads.nordcdn.com/configs/archives/servers/ovpn.zip".to_string();
+        let mut is_github_repo = false;
+
+        if let Ok(alt_url) = env::var("NORDVPN_ALT_CONFIG_URL") {
+            if !alt_url.is_empty() {
+                info!("Using alternative NordVPN config URL: {}", alt_url);
+                if alt_url.starts_with("https://github.com/") {
+                    // Basic check, assuming "main" branch for now.
+                    // Format: https://github.com/user/repo -> https://github.com/user/repo/archive/refs/heads/main.zip
+                    let parts: Vec<&str> = alt_url.trim_end_matches('/').split('/').collect();
+                    if parts.len() >= 5 { // https: / / github.com / user / repo
+                        source_url = format!("https://github.com/{}/{}/archive/refs/heads/main.zip", parts[3], parts[4]);
+                        info!("Transformed GitHub URL to: {}", source_url);
+                        is_github_repo = true;
+                    } else {
+                        warn!("NORDVPN_ALT_CONFIG_URL looks like a GitHub URL but is malformed, using it directly: {}", alt_url);
+                        source_url = alt_url;
+                    }
+                } else {
+                    source_url = alt_url;
+                }
+            }
+        }
+
         let config_choice = ConfigType::index_to_variant(
             uiclient.get_configuration_choice(&ConfigType::default())?,
         );
-        let zipfile = reqwest::blocking::get(url)?;
-        let mut zip = ZipArchive::new(Cursor::new(zipfile.bytes()?))?;
-        let protocol_dir = match config_choice.get_protocol() {
+        debug!("Requesting NordVPN configs from URL: {}", source_url);
+        let zipfile_response = reqwest::blocking::get(&source_url)?;
+        if !zipfile_response.status().is_success() {
+            return Err(anyhow!("Failed to download NordVPN configs from {}: {}", source_url, zipfile_response.status()));
+        }
+        let zip_bytes = zipfile_response.bytes()?;
+        let mut zip = ZipArchive::new(Cursor::new(zip_bytes))?;
+
+        let protocol_dir_name = match config_choice.get_protocol() {
             OpenVpnProtocol::TCP => "ovpn_tcp",
             OpenVpnProtocol::UDP => "ovpn_udp",
         };
+
         let server_regex = Regex::new(r"([a-z]+)(?:-(onion|[a-z]+))?([0-9]+)").unwrap();
+        let mut found_files = false;
+
         for i in 0..zip.len() {
             let mut file_contents: Vec<u8> = Vec::with_capacity(2048);
             let mut file = zip.by_index(i).unwrap();
 
-            // TODO: sanitized_name is now deprecated but there is not a simple alternative
-            #[allow(deprecated)]
-            if !file.sanitized_name().starts_with(protocol_dir) {
+            let mut file = zip.by_index(i)?;
+            if file.is_dir() {
                 continue;
             }
-            file.read_to_end(&mut file_contents)?;
 
-            #[allow(deprecated)]
-            let filename = if let Some("ovpn") = file
-                .sanitized_name()
-                .extension()
-                .map(|x| x.to_str().expect("Could not convert OsStr"))
-            {
-                let enclosed_name = file.enclosed_name();
-                let fname = enclosed_name
-                    .and_then(|x| x.file_name().map(|x| x.to_string_lossy().to_string()));
+            let full_path_str = file.name().to_string();
+            let path_parts: Vec<&str> = full_path_str.split('/').collect();
 
-                if fname.is_none() {
-                    debug!("Could not parse filename: {}", file.name());
-                    continue;
-                }
-                let fname = fname.unwrap();
-                let server_name = fname.to_lowercase().replace(' ', "_");
-                let server_name = server_name.split('.').next().unwrap();
-
-                if let Some(cap) = server_regex.captures(server_name) {
-                    // check whether the server is a special config type
-                    // or not, and discard ones not in line with user's
-                    // selection
-                    if let Some(config_type) = cap.get(2) {
-                        if (config_type.as_str() == "onion" && !config_choice.is_onion())
-                            || !config_choice.is_double()
-                        {
-                            continue;
-                        }
-                    } else if config_choice.is_onion() || config_choice.is_double() {
-                        continue;
-                    }
-
-                    if let Some(code) = cap.get(1) {
-                        let country = country_map.get(code.as_str());
-                        if country.is_none() {
-                            debug!("Could not map country code to name: {}", code.as_str());
-                            fname.to_string()
-                        } else {
-                            let server_name = server_name.replace('-', "_");
-                            format!("{}-{}.ovpn", country.unwrap(), server_name)
-                        }
-                    } else {
-                        debug!("Filename did not match established pattern: {fname}");
-                        fname.to_string()
-                    }
-                } else {
-                    debug!("Filename did not match established pattern: {fname}");
-                    fname.to_string()
-                }
+            // Determine effective path parts for matching, skipping potential repo root dir
+            let relevant_path_parts = if is_github_repo && path_parts.len() > 1 {
+                // If it's a github repo and path has more than one part,
+                // assume the first part is the repo-branch name and skip it.
+                &path_parts[1..]
             } else {
-                file.name().to_string()
+                &path_parts[..]
             };
 
-            debug!("Reading file: {}", file.name());
-            let mut outfile =
-                File::create(openvpn_dir.join(filename.to_lowercase().replace(' ', "_")))?;
-            outfile.write_all(file_contents.as_slice())?;
+            if relevant_path_parts.is_empty() || relevant_path_parts[0] != protocol_dir_name {
+                continue;
+            }
+
+            // Check if the file extension is .ovpn
+            if !full_path_str.ends_with(".ovpn") {
+                continue;
+            }
+
+            found_files = true; // Mark that we've found relevant files to process
+            file.read_to_end(&mut file_contents)?;
+
+            // Extract the simple filename (e.g., "us1234.nordvpn.com.udp.ovpn")
+            let simple_filename = relevant_path_parts.last().unwrap_or(&"").to_string();
+            if simple_filename.is_empty() {
+                debug!("Skipping empty filename derived from path: {}", full_path_str);
+                continue;
+            }
+
+            let server_name_for_regex = simple_filename.split('.').next().unwrap_or("").to_lowercase();
+
+            let output_filename = if let Some(cap) = server_regex.captures(&server_name_for_regex) {
+                // Check special config type (Onion, DoubleVPN)
+                // The regex captures group 2 for this. e.g. us-onion123 -> group 2 is "onion"
+                // For the alternative repo, filenames are like "ad1.nordvpn.com.udp.ovpn",
+                // so group 2 will likely be None unless the server name itself contains "onion" or similar.
+                let special_type_in_name = cap.get(2).map(|m| m.as_str());
+
+                if config_choice.is_onion() {
+                    if special_type_in_name != Some("onion") { // Strict check for "onion"
+                        debug!("Skipping file {} (server name {}) as it's not an Onion server but Onion config type was chosen.", full_path_str, server_name_for_regex);
+                        continue;
+                    }
+                } else if config_choice.is_double() {
+                     // For DoubleVPN, the official zip might have names like country1-country2.nordvpn.com
+                     // The regex might capture the first country. If `special_type_in_name` is Some and not "onion",
+                     // it might indicate a double VPN like "us-ca".
+                     // If the alternative repo doesn't follow this, this check might not be effective.
+                    if special_type_in_name.is_none() || special_type_in_name == Some("onion") {
+                        debug!("Skipping file {} (server name {}) as it's not a DoubleVPN server but DoubleVPN config type was chosen.", full_path_str, server_name_for_regex);
+                        continue;
+                    }
+                } else { // Standard config type chosen
+                    if special_type_in_name.is_some() {
+                        debug!("Skipping file {} (server name {}) as it seems to be a special type server (e.g., Onion/Double) but standard config type was chosen.", full_path_str, server_name_for_regex);
+                        continue;
+                    }
+                }
+
+                // Group 1 is the country code or first part of server name.
+                if let Some(code_match) = cap.get(1) {
+                    let code = code_match.as_str();
+                    let country_display_name = country_map.get(code).cloned().unwrap_or_else(|| {
+                        debug!("Could not map country code '{}' from server name '{}' to a full name. Using code.", code, server_name_for_regex);
+                        code
+                    });
+                    // Use the full server_name_for_regex for uniqueness in filename, replace '-' with '_'
+                    let server_identifier = server_name_for_regex.replace('-', "_");
+                    format!("{}-{}.ovpn", country_display_name, server_identifier)
+                } else {
+                    debug!("Filename {} did not match expected pattern (no country code part). Using original simple filename.", full_path_str);
+                    simple_filename
+                }
+            } else {
+                debug!("Filename {} (server name {}) did not match established server regex. Using original simple filename.", full_path_str, server_name_for_regex);
+                simple_filename
+            };
+
+
+            debug!("Processing file: {} as {}", full_path_str, output_filename);
+            let mut outfile = File::create(openvpn_dir.join(output_filename.to_lowercase().replace(' ', "_")))?;
+            outfile.write_all(&file_contents)?;
+        }
+
+        if !found_files {
+            warn!("No OpenVPN configuration files found for the selected protocol ({}) and source ({}). This might be due to an incorrect NORDVPN_ALT_CONFIG_URL, an empty/wrongly structured ZIP, or choosing a special server type not present in the source.", protocol_dir_name, source_url);
         }
 
         // Write OpenVPN credentials file

@@ -262,7 +262,7 @@ In non-interactive mode:
 
 To ensure a fully unattended sync for providers requiring authentication:
 - For username/password based auth (like PIA, HMA, IVPN OpenVPN), run `vopono sync` interactively once to cache the credentials in the provider's `auth.txt` file.
-- For NordVPN, set the `NORDVPN_USERNAME` and `NORDVPN_PASSWORD` environment variables. Alternatively, run `vopono sync` interactively once to cache credentials.
+For NordVPN, set the `NORDVPN_USERNAME` and `NORDVPN_PASSWORD` environment variables. Alternatively, run `vopono sync` interactively once to cache credentials. You can also specify an alternative source for NordVPN's OpenVPN configuration files by setting the `NORDVPN_ALT_CONFIG_URL` environment variable. This can be a direct URL to a ZIP file or a URL to a public GitHub repository (e.g., `https://github.com/user/repo`), from which `vopono` will attempt to download the main branch as a ZIP. Note that if the alternative source does not use the same naming conventions as the official NordVPN configurations for special server types (like Onion or Double VPN), selecting these types during sync might not find any matching servers from the alternative source.
 - For AirVPN, ensure the `AIRVPN_API_KEY` environment variable is set.
 - For ProtonVPN, the initial cookie fetching step is inherently interactive; non-interactive sync will likely fail at this step unless the cookie mechanism changes or is pre-configured.
 - For Mullvad/AzireVPN WireGuard, ensure `wireguard_device.json` is populated (either by a previous interactive run or manual setup) if you want to use specific existing keys/devices non-interactively.
