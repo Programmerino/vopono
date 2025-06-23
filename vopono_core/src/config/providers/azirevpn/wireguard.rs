@@ -302,7 +302,7 @@ impl WireguardProvider for AzireVPN {
             };
 
             let wireguard_conf = WireguardConfig {
-                interface: interface.clone(),
+                interface: final_interface.clone(),
                 peer: wireguard_peer,
             };
             let location_name = location.name.as_str();
