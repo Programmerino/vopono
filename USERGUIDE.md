@@ -261,7 +261,8 @@ In non-interactive mode:
 - For providers like Mullvad and AzireVPN (WireGuard), non-interactive sync will prioritize using a local cache file (`wireguard_device.json` in the provider's config directory) if it exists. If not, and keys/devices exist on the account, it will error out to avoid ambiguity, prompting you to run interactively once to establish the cache. If no keys/devices exist on the account and no cache file is present, it will attempt to generate and register a new key/device.
 
 To ensure a fully unattended sync for providers requiring authentication:
-- For username/password based auth, run `vopono sync` interactively once to cache the credentials in the provider's `auth.txt` file.
+- For username/password based auth (like PIA, HMA, IVPN OpenVPN), run `vopono sync` interactively once to cache the credentials in the provider's `auth.txt` file.
+- For NordVPN, set the `NORDVPN_USERNAME` and `NORDVPN_PASSWORD` environment variables. Alternatively, run `vopono sync` interactively once to cache credentials.
 - For AirVPN, ensure the `AIRVPN_API_KEY` environment variable is set.
 - For ProtonVPN, the initial cookie fetching step is inherently interactive; non-interactive sync will likely fail at this step unless the cookie mechanism changes or is pre-configured.
 - For Mullvad/AzireVPN WireGuard, ensure `wireguard_device.json` is populated (either by a previous interactive run or manual setup) if you want to use specific existing keys/devices non-interactively.

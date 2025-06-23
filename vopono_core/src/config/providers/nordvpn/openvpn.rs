@@ -3,8 +3,10 @@ use super::{ConfigurationChoice, OpenVpnProvider};
 use crate::config::providers::{Input, Password, UiClient};
 use crate::config::vpn::OpenVpnProtocol;
 use crate::util::delete_all_files_in_dir;
-use log::debug;
+use anyhow::anyhow;
+use log::{debug, info};
 use regex::Regex;
+use std::env;
 use std::fmt::Display;
 use std::fs::File;
 use std::fs::create_dir_all;
@@ -24,16 +26,29 @@ impl OpenVpnProvider for NordVPN {
     }
 
     fn prompt_for_auth(&self, uiclient: &dyn UiClient) -> anyhow::Result<(String, String)> {
-        let username = uiclient.get_input(Input {
-            prompt: "NordVPN username".to_string(),
-            validator: None,
-        })?;
+        match (env::var("NORDVPN_USERNAME"), env::var("NORDVPN_PASSWORD")) {
+            (Ok(username), Ok(password)) if !username.is_empty() && !password.is_empty() => {
+                info!("Using NordVPN credentials from environment variables.");
+                Ok((username, password))
+            }
+            _ => {
+                if uiclient.is_interactive() {
+                    debug!("NordVPN credentials not found in environment variables or are incomplete. Prompting user.");
+                    let username = uiclient.get_input(Input {
+                        prompt: "NordVPN username".to_string(),
+                        validator: None,
+                    })?;
 
-        let password = uiclient.get_password(Password {
-            prompt: "Password".to_string(),
-            confirm: true,
-        })?;
-        Ok((username, password))
+                    let password = uiclient.get_password(Password {
+                        prompt: "Password".to_string(),
+                        confirm: true,
+                    })?;
+                    Ok((username, password))
+                } else {
+                    Err(anyhow!("NordVPN credentials (NORDVPN_USERNAME, NORDVPN_PASSWORD) not found in environment variables for non-interactive mode."))
+                }
+            }
+        }
     }
 
     fn auth_file_path(&self) -> anyhow::Result<Option<PathBuf>> {
