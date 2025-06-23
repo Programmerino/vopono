@@ -64,23 +64,31 @@ impl OpenVpnProvider for NordVPN {
         let mut source_url = "https://downloads.nordcdn.com/configs/archives/servers/ovpn.zip".to_string();
         let mut is_github_repo = false;
 
-        if let Ok(alt_url) = env::var("NORDVPN_ALT_CONFIG_URL") {
-            if !alt_url.is_empty() {
-                info!("Using alternative NordVPN config URL: {}", alt_url);
-                if alt_url.starts_with("https://github.com/") {
-                    // Basic check, assuming "main" branch for now.
-                    // Format: https://github.com/user/repo -> https://github.com/user/repo/archive/refs/heads/main.zip
-                    let parts: Vec<&str> = alt_url.trim_end_matches('/').split('/').collect();
+        if let Ok(alt_url_env) = env::var("NORDVPN_ALT_CONFIG_URL") {
+            if !alt_url_env.is_empty() {
+                info!("Using alternative NordVPN config URL from environment: {}", alt_url_env);
+                if alt_url_env.ends_with(".zip") {
+                    source_url = alt_url_env;
+                    // We can infer it's a GitHub repo if the URL contains github.com,
+                    // useful for path stripping later, even if it's a direct zip link.
+                    if alt_url_env.contains("github.com") {
+                        is_github_repo = true; // It's a zip, possibly from GitHub
+                    }
+                } else if alt_url_env.starts_with("https://github.com/") {
+                    // It's a GitHub repo URL, not a direct zip link. Transform it.
+                    let parts: Vec<&str> = alt_url_env.trim_end_matches('/').split('/').collect();
                     if parts.len() >= 5 { // https: / / github.com / user / repo
+                        // Default to 'main' branch. User must provide full .zip URL for other branches.
                         source_url = format!("https://github.com/{}/{}/archive/refs/heads/main.zip", parts[3], parts[4]);
-                        info!("Transformed GitHub URL to: {}", source_url);
+                        info!("Transformed GitHub repository URL to main branch ZIP: {}", source_url);
                         is_github_repo = true;
                     } else {
-                        warn!("NORDVPN_ALT_CONFIG_URL looks like a GitHub URL but is malformed, using it directly: {}", alt_url);
-                        source_url = alt_url;
+                        warn!("NORDVPN_ALT_CONFIG_URL looks like a GitHub repository URL but is malformed. Using it directly: {}", alt_url_env);
+                        source_url = alt_url_env; // May or may not be a valid ZIP URL
                     }
                 } else {
-                    source_url = alt_url;
+                    // Not ending in .zip and not a github.com repo URL, assume it's a direct ZIP URL.
+                    source_url = alt_url_env;
                 }
             }
         }
