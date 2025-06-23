@@ -68,12 +68,12 @@ impl OpenVpnProvider for NordVPN {
             if !alt_url_env.is_empty() {
                 info!("Using alternative NordVPN config URL from environment: {}", alt_url_env);
                 if alt_url_env.ends_with(".zip") {
-                    source_url = alt_url_env;
                     // We can infer it's a GitHub repo if the URL contains github.com,
                     // useful for path stripping later, even if it's a direct zip link.
                     if alt_url_env.contains("github.com") {
                         is_github_repo = true; // It's a zip, possibly from GitHub
                     }
+                    source_url = alt_url_env;
                 } else if alt_url_env.starts_with("https://github.com/") {
                     // It's a GitHub repo URL, not a direct zip link. Transform it.
                     let parts: Vec<&str> = alt_url_env.trim_end_matches('/').split('/').collect();
