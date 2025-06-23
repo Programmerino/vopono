@@ -106,7 +106,6 @@ impl OpenVpnProvider for NordVPN {
 
         for i in 0..zip.len() {
             let mut file_contents: Vec<u8> = Vec::with_capacity(2048);
-            let mut file = zip.by_index(i).unwrap();
 
             let mut file = zip.by_index(i)?;
             if file.is_dir() {
