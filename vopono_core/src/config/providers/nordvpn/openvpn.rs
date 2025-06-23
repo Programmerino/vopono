@@ -4,7 +4,7 @@ use crate::config::providers::{Input, Password, UiClient};
 use crate::config::vpn::OpenVpnProtocol;
 use crate::util::delete_all_files_in_dir;
 use anyhow::anyhow;
-use log::{debug, info};
+use log::{debug, info, warn};
 use regex::Regex;
 use std::env;
 use std::fmt::Display;
