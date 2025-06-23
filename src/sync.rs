@@ -1,8 +1,8 @@
 use anyhow::bail;
 use clap::ValueEnum;
-use dialoguer::MultiSelect;
 use log::{error, info};
 use vopono_core::config::providers::{UiClient, VpnProvider};
+use dialoguer::MultiSelect;
 use vopono_core::config::vpn::Protocol;
 use vopono_core::util::set_config_permissions;
 
@@ -17,20 +17,40 @@ pub fn sync_menu(uiclient: &dyn UiClient, protocol: Option<Protocol>) -> anyhow:
         .map(|x| x.to_variant().to_string())
         .collect::<Vec<String>>();
 
-    let selection: Vec<usize> = MultiSelect::new()
-        .with_prompt("Which VPN providers do you wish to synchronise? Press Space to select and Enter to continue")
-        .items(variants.as_slice())
-        .interact()?;
+    let providers_to_sync: Vec<WrappedArg<VpnProvider>> = if uiclient.is_interactive() {
+        let selection: Vec<usize> = MultiSelect::new()
+            .with_prompt("Which VPN providers do you wish to synchronise? Press Space to select and Enter to continue")
+            .items(variants.as_slice())
+            .interact()?;
 
-    if selection.is_empty() {
-        bail!("Must choose at least one VPN provider to sync");
+        if selection.is_empty() {
+            bail!("Must choose at least one VPN provider to sync");
+        }
+        selection
+            .into_iter()
+            .flat_map(|x| WrappedArg::<VpnProvider>::from_str(&variants[x], true))
+            .collect()
+    } else {
+        // Non-interactive: sync all applicable providers
+        info!("Non-interactive mode: Syncing all available providers.");
+        WrappedArg::<VpnProvider>::value_variants()
+            .iter()
+            .filter(|x| {
+                ![VpnProvider::Custom, VpnProvider::None, VpnProvider::Warp].contains(&x.to_variant())
+            })
+            .cloned()
+            .collect()
+    };
+
+    if providers_to_sync.is_empty() {
+        // This case should ideally not be reached if logic is correct,
+        // especially for non-interactive which syncs all.
+        // But as a safeguard:
+        bail!("No VPN providers selected or available for sync.");
     }
 
-    for provider in selection
-        .into_iter()
-        .flat_map(|x| WrappedArg::<VpnProvider>::from_str(&variants[x], true))
-    {
-        synch(provider.to_variant(), &protocol, uiclient)?;
+    for provider_arg in providers_to_sync {
+        synch(provider_arg.to_variant(), &protocol, uiclient)?;
     }
 
     Ok(())

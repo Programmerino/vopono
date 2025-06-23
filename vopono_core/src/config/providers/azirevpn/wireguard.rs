@@ -121,149 +121,162 @@ impl WireguardProvider for AzireVPN {
 
         let country_map = code_to_country_map();
 
-        // This creates an API token for the user if we do not have one cached
-        let token = self.get_access_token(uiclient)?;
-        let user_profile_response: UserProfileResponse = client
-            .get("https://api.azirevpn.com/v3/users/me")
-            .header("Authorization", format!("Bearer {token}"))
-            .send()?
-            .json().with_context(|| "Failed to parse AzireVPN user profile response - if this persists try deleting cached data at ~/.config/vopono/azire/ and/or manually deleting access tokens at https://manager.azirevpn.com/account/token")?;
+        let wireguard_details_path = self.wireguard_dir()?.join("wireguard_device.json");
+        let mut interface: Option<WireguardInterface> = None;
 
-        if !user_profile_response.data.is_active {
-            log::error!(
-                "AzireVPN reports that account is inactive - please check your account status"
-            );
-        }
-
-        // Note with AzireVPN it is possible to replace keys but keep an existing device
-        // This could be useful for separate long-term port forwarding set ups
-        // So we also support replacing keys for existing devices
-
-        // WireguardInterface is defined by device selection
-        let interface: WireguardInterface = if user_profile_response.data.ips.allocated > 0 {
-            // Existing Wireguard devices registered - ask to select and enter private key
-            // Or replace existing keys with new keypair
-            let existing_devices: ExistingDevicesResponse = client
-                .get("https://api.azirevpn.com/v3/ips")
-                .bearer_auth(&token)
-                .send()?
-                .json()
-                .with_context(|| "Failed to parse existing devices response")?;
-
-            let selection = uiclient.get_configuration_choice(&existing_devices)?;
-
-            if selection >= existing_devices.data.len() {
-                if user_profile_response.data.ips.allocated
-                    >= user_profile_response.data.ips.available
-                {
-                    log::error!(
-                        "Maximum number of devices registered - please delete an existing device at https://manager.azirevpn.com/wireguard before creating a new one"
-                    );
-                    return Err(anyhow::anyhow!("Maximum number of devices registered"));
-                }
-                // Create new device
-                let keypair: WgKey = generate_keypair()?;
-                debug!("Chosen keypair: {keypair:?}");
-                self.upload_wg_key(&keypair, &token, &client)?
-            } else {
-                let existing_device = &existing_devices.data[selection];
-                let replace_keys = uiclient.get_bool_choice(BoolChoice {
-                    prompt: "Would you like to replace the existing keys for this device?"
-                        .to_string(),
-                    default: false,
-                })?;
-
-                if replace_keys {
-                    // Replace existing keys
-                    let keypair: WgKey = generate_keypair()?;
-                    debug!("Chosen keypair: {keypair:?}");
-                    self.replace_wg_key(existing_device, &keypair, &token, &client)?
-                } else {
-                    // Use existing device
-                    // TODO: Refactor common code between this and Mullvad key management
-
-                    let pubkey = if existing_device.keys.len() > 1 {
-                        let key_selection = uiclient.get_configuration_choice(existing_device)?;
-                        existing_device.keys[key_selection].key.clone()
-                    } else {
-                        existing_device.keys[0].key.clone()
-                    };
-                    let pubkey_clone = pubkey.clone();
-
-                    // Check number of public keys - if more than 1 prompt for key to use
-                    let private_key = uiclient.get_input(crate::config::providers::Input {
-                        prompt: format!(
-                            "Private key for {} - {}",
-                            existing_device.device_name, pubkey
-                        ),
-                        validator: Some(Box::new(
-                            move |private_key: &String| -> Result<(), String> {
-                                let private_key = private_key.trim();
-
-                                if private_key.len() != 44 {
-                                    return Err(
-                                        "Expected private key length of 44 characters".to_string()
-                                    );
-                                }
-
-                                match generate_public_key(private_key) {
-                                    Ok(public_key) => {
-                                        if public_key != pubkey_clone {
-                                            return Err(
-                                                "Private key does not match public key".to_string()
-                                            );
-                                        }
-                                        Ok(())
-                                    }
-                                    Err(_) => Err("Failed to generate public key".to_string()),
-                                }
-                            },
-                        )),
-                    })?;
-
-                    let v4_net = IpNet::new(
-                        IpAddr::V4(Ipv4Addr::from_str(&existing_device.ipv4_address)?),
-                        existing_device.ipv4_netmask,
-                    )?;
-                    WireguardInterface {
-                        private_key,
-                        address: vec![v4_net],
-                        dns: Some(existing_device.dns.clone()),
-                        mtu: Some(1420.to_string()),
+        if !uiclient.is_interactive() {
+            if wireguard_details_path.exists() {
+                info!("Non-interactive mode: Loading Wireguard device info from {}", wireguard_details_path.display());
+                match std::fs::read_to_string(&wireguard_details_path) {
+                    Ok(file_content) => {
+                        match serde_json::from_str::<WireguardDetails>(&file_content) {
+                            Ok(details) => {
+                                interface = Some(WireguardInterface {
+                                    private_key: details.private_key,
+                                    address: details.addresses,
+                                    dns: Some(details.dns), // Assuming WireguardDetails will store DNS
+                                    mtu: Some(1420.to_string()),
+                                });
+                                info!("Successfully loaded Wireguard details from cache.");
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to parse JSON from {}: {}. Will attempt API.", wireguard_details_path.display(), e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to read {}: {}. Will attempt API.", wireguard_details_path.display(), e);
                     }
                 }
             }
-        } else {
-            // No existing devices - create new device
-            // Note max devices is limited to 10 registered, 5 concurrent connections
-            // Start device and keypair generation
-            let keypair: WgKey = generate_keypair()?;
-            debug!("Chosen keypair: {keypair:?}");
-            self.upload_wg_key(&keypair, &token, &client)?
-        };
-
-        // Save keypair
-        let details = WireguardDetails::from_interface(&interface);
-        if let Ok(det) = details {
-            let path = self.wireguard_dir()?.join("wireguard_device.json");
-            {
-                let mut f = std::fs::File::create(path.clone())?;
-                write!(
-                    f,
-                    "{}",
-                    serde_json::to_string(&det)
-                        .expect("JSON serialisation of WireguardDetails failed")
-                )?;
-            }
-            info!(
-                "Saved Wireguard keypair details to {}",
-                &path.to_string_lossy()
-            );
-        } else {
-            log::error!("Failed to save Wireguard keypair details: {details:?}");
         }
 
-        // This gets locations data from token
+        let token = self.get_access_token(uiclient)?; // This may fail if non-interactive and token/creds not available
+
+        if interface.is_none() { // Did not load from cache or interactive mode
+            let user_profile_response: UserProfileResponse = client
+                .get("https://api.azirevpn.com/v3/users/me")
+                .header("Authorization", format!("Bearer {token}"))
+                .send()?
+                .json().with_context(|| "Failed to parse AzireVPN user profile response - if this persists try deleting cached data at ~/.config/vopono/azire/ and/or manually deleting access tokens at https://manager.azirevpn.com/account/token")?;
+
+            if !user_profile_response.data.is_active {
+                log::error!("AzireVPN reports that account is inactive - please check your account status");
+                // Potentially return an error here if account inactive is critical
+            }
+
+            if !uiclient.is_interactive() { // Non-interactive and cache load failed/skipped
+                if user_profile_response.data.ips.allocated > 0 {
+                    return Err(anyhow::anyhow!("Non-interactive mode: Existing devices found on AzireVPN account, but no local 'wireguard_device.json' or it was invalid. Run vopono sync interactively to select/create/save a key, or manually create 'wireguard_device.json'."));
+                }
+                if user_profile_response.data.ips.allocated >= user_profile_response.data.ips.available {
+                     return Err(anyhow::anyhow!("Non-interactive mode: Maximum number of devices registered on AzireVPN account."));
+                }
+                info!("Non-interactive mode: No existing devices or local cache. Generating new keypair.");
+                let keypair: WgKey = generate_keypair()?;
+                debug!("Generated keypair: {keypair:?}");
+                interface = Some(self.upload_wg_key(&keypair, &token, &client)?);
+
+            } else { // Interactive mode logic
+                interface = Some(if user_profile_response.data.ips.allocated > 0 {
+                    let existing_devices: ExistingDevicesResponse = client
+                        .get("https://api.azirevpn.com/v3/ips")
+                        .bearer_auth(&token)
+                        .send()?
+                        .json()
+                        .with_context(|| "Failed to parse existing devices response")?;
+
+                    let selection = uiclient.get_configuration_choice(&existing_devices)?;
+
+                    if selection >= existing_devices.data.len() { // Create new device
+                        if user_profile_response.data.ips.allocated >= user_profile_response.data.ips.available {
+                            log::error!("Maximum number of devices registered - please delete an existing device at https://manager.azirevpn.com/wireguard before creating a new one");
+                            return Err(anyhow::anyhow!("Maximum number of devices registered"));
+                        }
+                        let keypair: WgKey = generate_keypair()?;
+                        debug!("Chosen keypair: {keypair:?}");
+                        self.upload_wg_key(&keypair, &token, &client)?
+                    } else { // Use existing device
+                        let existing_device = &existing_devices.data[selection];
+                        let replace_keys = uiclient.get_bool_choice(BoolChoice {
+                            prompt: "Would you like to replace the existing keys for this device?".to_string(),
+                            default: false,
+                        })?;
+
+                        if replace_keys {
+                            let keypair: WgKey = generate_keypair()?;
+                            debug!("Chosen keypair: {keypair:?}");
+                            self.replace_wg_key(existing_device, &keypair, &token, &client)?
+                        } else {
+                            let pubkey = if existing_device.keys.len() > 1 {
+                                let key_selection = uiclient.get_configuration_choice(existing_device)?;
+                                existing_device.keys[key_selection].key.clone()
+                            } else {
+                                existing_device.keys[0].key.clone()
+                            };
+                            let pubkey_clone = pubkey.clone();
+                            let private_key = uiclient.get_input(crate::config::providers::Input {
+                                prompt: format!("Private key for {} - {}", existing_device.device_name, pubkey),
+                                validator: Some(Box::new(move |pk_str: &String| {
+                                    let pk_str = pk_str.trim();
+                                    if pk_str.len() != 44 { return Err("Expected private key length of 44 characters".to_string()); }
+                                    match generate_public_key(pk_str) {
+                                        Ok(public_key) if public_key == pubkey_clone => Ok(()),
+                                        Ok(_) => Err("Private key does not match public key".to_string()),
+                                        Err(_) => Err("Failed to generate public key".to_string()),
+                                    }
+                                })),
+                            })?;
+                            let v4_net = IpNet::new(IpAddr::V4(Ipv4Addr::from_str(&existing_device.ipv4_address)?), existing_device.ipv4_netmask)?;
+                            WireguardInterface {
+                                private_key,
+                                address: vec![v4_net], // Assuming only IPv4 for now based on structure
+                                dns: Some(existing_device.dns.clone()),
+                                mtu: Some(1420.to_string()),
+                            }
+                        }
+                    }
+                } else { // No existing devices - create new device
+                    if user_profile_response.data.ips.allocated >= user_profile_response.data.ips.available {
+                        log::error!("Maximum number of devices registered and none allocated? This state should not happen.");
+                         return Err(anyhow::anyhow!("Maximum number of devices registered"));
+                    }
+                    let keypair: WgKey = generate_keypair()?;
+                    debug!("Chosen keypair: {keypair:?}");
+                    self.upload_wg_key(&keypair, &token, &client)?
+                });
+            }
+             // Save the determined/created interface details
+            if let Some(ref intf) = interface {
+                match WireguardDetails::from_interface(intf) {
+                    Ok(det) => {
+                        if let Err(e) = std::fs::create_dir_all(wireguard_details_path.parent().unwrap()) {
+                             log::warn!("Could not create directory for wireguard_device.json: {}", e);
+                        } else {
+                            match std::fs::File::create(&wireguard_details_path) {
+                                Ok(mut f) => {
+                                    if let Err(e) = write!(f, "{}", serde_json::to_string(&det).expect("JSON serialisation of WireguardDetails failed")) {
+                                        log::warn!("Failed to write to wireguard_device.json: {}", e);
+                                    } else {
+                                        info!("Saved Wireguard keypair details to {}", wireguard_details_path.display());
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to create wireguard_device.json: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to convert interface to WireguardDetails for saving: {}", e);
+                    }
+                }
+            }
+        }
+
+        let final_interface = interface.ok_or_else(|| anyhow::anyhow!("Failed to determine Wireguard interface for AzireVPN"))?;
+
+        // This gets locations data
         let location_resp: LocationsResponse = client.get(self.locations_url()).send()?.json()?;
 
         debug!("locations_response: {:?}", &location_resp);
@@ -326,6 +339,7 @@ struct WireguardDetails {
     public_key: String,
     private_key: String,
     addresses: Vec<IpNet>,
+    dns: Vec<IpAddr>,
 }
 
 impl WireguardDetails {
@@ -334,6 +348,7 @@ impl WireguardDetails {
             public_key: generate_public_key(interface.private_key.as_str())?,
             private_key: interface.private_key.clone(),
             addresses: interface.address.clone(),
+            dns: interface.dns.clone().unwrap_or_default(),
         })
     }
 }

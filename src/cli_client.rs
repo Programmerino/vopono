@@ -68,4 +68,8 @@ impl UiClient for CliClient {
         req = req.with_prompt(pw.prompt);
         Ok(req.interact()?)
     }
+
+    fn is_interactive(&self) -> bool {
+        true
+    }
 }

@@ -54,4 +54,5 @@ pub trait UiClient {
     fn get_input(&self, input: Input) -> anyhow::Result<String>;
     fn get_input_numeric_u16(&self, input: InputNumericu16) -> anyhow::Result<u16>;
     fn get_password(&self, password: Password) -> anyhow::Result<String>;
+    fn is_interactive(&self) -> bool;
 }

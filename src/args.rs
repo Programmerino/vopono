@@ -115,6 +115,10 @@ pub struct SynchCommand {
     /// VPN Protocol (if not given will try to sync both)
     #[clap(value_enum, long = "protocol", short = 'c', ignore_case = true)]
     pub protocol: Option<WrappedArg<Protocol>>,
+
+    /// Run in non-interactive mode, using defaults and skipping prompts
+    #[clap(long = "non-interactive")]
+    pub non_interactive: bool,
 }
 
 #[derive(Parser)]

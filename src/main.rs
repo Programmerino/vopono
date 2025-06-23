@@ -13,6 +13,7 @@ mod sync;
 use clap::Parser;
 use cli_client::CliClient;
 use list::output_list;
+use vopono_core::config::providers::{NonInteractiveUiClient, UiClient};
 use list_configs::print_configs;
 use log::{LevelFilter, warn};
 use sync::{sync_menu, synch};
@@ -37,9 +38,9 @@ fn main() -> anyhow::Result<()> {
     }
     builder.init();
 
-    let uiclient = CliClient {};
     match app.cmd {
         args::Command::Exec(cmd) => {
+            let uiclient = CliClient {}; // Exec command likely still needs interactive client for some scenarios
             clean_dead_locks()?;
             let verbose = app.verbose && !app.silent;
             elevate_privileges(app.askpass)?;
@@ -51,14 +52,19 @@ fn main() -> anyhow::Result<()> {
             output_list(listcmd)?;
         }
         args::Command::Synch(synchcmd) => {
+            let uiclient: Box<dyn UiClient> = if synchcmd.non_interactive {
+                Box::new(NonInteractiveUiClient {})
+            } else {
+                Box::new(CliClient {})
+            };
             // If provider given then sync that, else prompt with menu
             if synchcmd.vpn_provider.is_none() {
-                sync_menu(&uiclient, synchcmd.protocol.map(|x| x.to_variant()))?;
+                sync_menu(uiclient.as_ref(), synchcmd.protocol.map(|x| x.to_variant()))?;
             } else {
                 synch(
                     synchcmd.vpn_provider.unwrap().to_variant(),
                     &synchcmd.protocol.map(|x| x.to_variant()),
-                    &uiclient,
+                    uiclient.as_ref(),
                 )?;
             }
         }

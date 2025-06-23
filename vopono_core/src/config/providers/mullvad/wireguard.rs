@@ -71,12 +71,69 @@ impl Mullvad {
     }
 
     fn prompt_for_wg_key(&self, uiclient: &dyn UiClient) -> anyhow::Result<(WgKey, IpNet, IpNet)> {
-        // - Get or upload keypair from/to Mullvad
-        //   - List existing keys
-        //     - Create new keypair and upload (save keypair locally too)
-        //     - Choose key and enter private key (validate that is valid for this public key)
-        // - Enter previously uploaded keypair manually
+        let wg_device_path = self.wireguard_dir()?.join("wireguard_device.json");
 
+        if !uiclient.is_interactive() {
+            // Non-interactive mode: try to load from wireguard_device.json first
+            if wg_device_path.exists() {
+                info!("Non-interactive mode: Loading Wireguard device info from {}", wg_device_path.display());
+                let file_content = std::fs::read_to_string(&wg_device_path)
+                    .with_context(|| format!("Failed to read {}", wg_device_path.display()))?;
+                let device_info: PrivateDevice = serde_json::from_str(&file_content)
+                    .with_context(|| format!("Failed to parse JSON from {}", wg_device_path.display()))?;
+
+                return Ok((
+                    WgKey {
+                        public: device_info.public_key,
+                        private: device_info.private_key,
+                    },
+                    IpNet::from_str(&device_info.ipv4_address).context("Invalid IPv4 address in wireguard_device.json")?,
+                    IpNet::from_str(&device_info.ipv6_address).context("Invalid IPv6 address in wireguard_device.json")?,
+                ));
+            } else {
+                // No local device file, proceed to API but with non-interactive constraints
+                info!("Non-interactive mode: {} not found. Attempting to use Mullvad API.", wg_device_path.display());
+                let client = Client::new();
+                // This will fail if account number is not cached/available non-interactively
+                let username = self.request_mullvad_username(uiclient)?;
+                let mut map = HashMap::new();
+                map.insert("account_number", username.clone());
+
+                let auth: AccessToken = client
+                    .post("https://api.mullvad.net/auth/v1/token".to_owned())
+                    .json(&map).send()?.error_for_status()?.json()?;
+                let user_info: UserInfo = client
+                    .get("https://api.mullvad.net/accounts/v1/accounts/me")
+                    .header(AUTHORIZATION, format!("Bearer {}", &auth.access_token))
+                    .send()?.error_for_status()?.json()?;
+
+                let existing_devices: Vec<Device> = client
+                    .get("https://api.mullvad.net/accounts/v1/devices")
+                    .header(AUTHORIZATION, format!("Bearer {}", &auth.access_token))
+                    .send()?.error_for_status()?.json()?;
+
+                if !existing_devices.is_empty() {
+                    return Err(anyhow!("Non-interactive mode: Existing Wireguard keys found on Mullvad account, but no local 'wireguard_device.json' was found. Run vopono sync interactively to select/create a key, or manually create 'wireguard_device.json'."));
+                }
+
+                if !user_info.can_add_devices || existing_devices.len() >= user_info.max_devices as usize {
+                    return Err(anyhow!("Non-interactive mode: Cannot add new Wireguard keys to this Mullvad account (max devices reached or adding disabled)."));
+                }
+
+                info!("Non-interactive mode: No existing keys on account and can add devices. Generating new keypair.");
+                let keypair = generate_keypair()?;
+                let dev = Mullvad::upload_wg_key(&client, &auth.access_token, &keypair)?;
+                let private_device_info = PrivateDevice::from_device(&dev, &keypair.private);
+                {
+                    let mut f = std::fs::File::create(&wg_device_path)?;
+                    write!(f, "{}", serde_json::to_string(&private_device_info)?)?;
+                }
+                info!("Saved new Wireguard keypair details to {}", wg_device_path.display());
+                return Ok((keypair, IpNet::from_str(&dev.ipv4_address)?, IpNet::from_str(&dev.ipv6_address)?));
+            }
+        }
+
+        // Interactive mode or non-interactive fallback (manual entry will fail if non-interactive)
         let use_automatic = uiclient.get_bool_choice(BoolChoice {
             prompt: "Handle Mullvad key upload automatically?".to_string(),
             default: true,
@@ -85,148 +142,104 @@ impl Mullvad {
         if use_automatic {
             let client = Client::new();
             let username = self.request_mullvad_username(uiclient)?;
-
             let mut map = HashMap::new();
             map.insert("account_number", username.clone());
 
             let auth: AccessToken = client
                 .post("https://api.mullvad.net/auth/v1/token".to_owned())
-                .json(&map)
-                .send()?
-                .json()?;
-
+                .json(&map).send()?.error_for_status()?.json()?;
             let user_info: UserInfo = client
                 .get("https://api.mullvad.net/accounts/v1/accounts/me")
                 .header(AUTHORIZATION, format!("Bearer {}", &auth.access_token))
-                .send()?
-                .json()?;
+                .send()?.error_for_status()?.json()?;
 
-            // Warn if account expired
             match DateTime::parse_from_rfc3339(&user_info.expiry) {
                 Ok(datetime) => {
-                    let datetime_utc = datetime.with_timezone(&Utc);
-                    if datetime_utc <= Utc::now() {
+                    if datetime.with_timezone(&Utc) <= Utc::now() {
                         warn!("Mullvad account expired on {}", &user_info.expiry);
                     }
                 }
                 Err(e) => warn!("Could not parse Mullvad account expiry date: {e}"),
             }
-
             debug!("Received user info: {user_info:?}");
 
             let existing_devices: Vec<Device> = client
                 .get("https://api.mullvad.net/accounts/v1/devices")
                 .header(AUTHORIZATION, format!("Bearer {}", &auth.access_token))
-                .send()?
-                .json()?;
+                .send()?.error_for_status()?.json()?;
 
             if !existing_devices.is_empty() {
-        let existing = Devices { devices: existing_devices.clone()};
+                let existing = Devices { devices: existing_devices.clone() };
+                let selection = uiclient.get_configuration_choice(&existing)?;
 
-        let selection = uiclient.get_configuration_choice(&existing)?;
-
-        if selection >= existing_devices.len() {
-            if existing_devices.len() >= user_info.max_devices as usize
-                || !user_info.can_add_devices
-            {
-                return Err(anyhow!("Cannot add more Wireguard keypairs to this account. Try to delete existing keypairs."));
-            }
-            let keypair = generate_keypair()?;
-            let dev = Mullvad::upload_wg_key(&client, &auth.access_token, &keypair)?;
-
-            // Save keypair
-            let path = self.wireguard_dir()?.join("wireguard_device.json");
-            {
-                let mut f = std::fs::File::create(path.clone())?;
-                write!(f, "{}", serde_json::to_string(&PrivateDevice::from_device(&dev, &keypair.private))?)?;
-            }
-            info!("Saved Wireguard keypair details to {}", &path.to_string_lossy());
-
-            Ok((keypair, IpNet::from_str(&dev.ipv4_address).expect("Invalid IPv4 address"), IpNet::from_str(&dev.ipv6_address).expect("Invalid IPv6 address")))
-        } else {
-            let dev = existing_devices[selection].clone();
-            let pubkey_clone = dev.pubkey.clone();
-
-            let private_key = uiclient.get_input(Input{
-                    prompt: format!("Private key for {}",
-                    &existing.devices[selection].pubkey
-                ),
-        validator: Some(Box::new(move |private_key: &String| -> Result<(), String> {
-
-            let private_key = private_key.trim();
-
-            if private_key.len() != 44 {
-                return Err("Expected private key length of 44 characters".to_string()
-                );
-            }
-
-            match generate_public_key(private_key) {
-                Ok(public_key) => {
-            if public_key != pubkey_clone {
-                return Err("Private key does not match public key".to_string());
-            }
-            Ok(())}
-                Err(_) => Err("Failed to generate public key".to_string())
- }}))})?;
-
-            // Save keypair
-            let path = self.wireguard_dir()?.join("wireguard_device.json");
-            {
-                let mut f = std::fs::File::create(path.clone())?;
-                write!(f, "{}", serde_json::to_string(&PrivateDevice::from_device(&dev, &private_key))?)?;
-            }
-            info!("Saved Wireguard keypair details to {}", &path.to_string_lossy());
-
-
- Ok((WgKey {
-                public: dev.pubkey.clone(),
-                private: private_key,
-            },
-        IpNet::from_str(&dev.ipv4_address).expect("Invalid IPv4 address"), IpNet::from_str(&dev.ipv6_address).expect("Invalid IPv6 address"))
-        )
-        }
-    } else if uiclient.get_bool_choice(BoolChoice{
-            prompt:
-                "No Wireguard keys currently exist on your Mullvad account, would you like to generate a new keypair?".to_string(),
-            default: true,
-    })?
-             {
+                if selection >= existing_devices.len() { // User chose "Generate new keypair"
+                    if existing_devices.len() >= user_info.max_devices as usize || !user_info.can_add_devices {
+                        return Err(anyhow!("Cannot add more Wireguard keypairs to this account. Try to delete existing keypairs."));
+                    }
+                    let keypair = generate_keypair()?;
+                    let dev = Mullvad::upload_wg_key(&client, &auth.access_token, &keypair)?;
+                    let private_device_info = PrivateDevice::from_device(&dev, &keypair.private);
+                    {
+                        let mut f = std::fs::File::create(&wg_device_path)?;
+                        write!(f, "{}", serde_json::to_string(&private_device_info)?)?;
+                    }
+                    info!("Saved Wireguard keypair details to {}", wg_device_path.display());
+                    Ok((keypair, IpNet::from_str(&dev.ipv4_address)?, IpNet::from_str(&dev.ipv6_address)?))
+                } else { // User chose an existing key
+                    let dev = existing_devices[selection].clone();
+                    let pubkey_clone = dev.pubkey.clone();
+                    let private_key = uiclient.get_input(Input{
+                        prompt: format!("Private key for {}", &existing.devices[selection].pubkey),
+                        validator: Some(Box::new(move |pk_str: &String| {
+                            let pk_str = pk_str.trim();
+                            if pk_str.len() != 44 { return Err("Expected private key length of 44 characters".to_string()); }
+                            match generate_public_key(pk_str) {
+                                Ok(public_key) if public_key == pubkey_clone => Ok(()),
+                                Ok(_) => Err("Private key does not match public key".to_string()),
+                                Err(_) => Err("Failed to generate public key".to_string()),
+                            }
+                        }))
+                    })?;
+                    let private_device_info = PrivateDevice::from_device(&dev, &private_key);
+                     {
+                        let mut f = std::fs::File::create(&wg_device_path)?;
+                        write!(f, "{}", serde_json::to_string(&private_device_info)?)?;
+                    }
+                    info!("Saved Wireguard keypair details to {}", wg_device_path.display());
+                    Ok((WgKey { public: dev.pubkey.clone(), private: private_key }, IpNet::from_str(&dev.ipv4_address)?, IpNet::from_str(&dev.ipv6_address)?))
+                }
+            } else if uiclient.get_bool_choice(BoolChoice{ // No existing keys
+                prompt: "No Wireguard keys currently exist on your Mullvad account, would you like to generate a new keypair?".to_string(),
+                default: true,
+            })? {
+                if !user_info.can_add_devices {
+                     return Err(anyhow!("Cannot add new Wireguard keys to this Mullvad account (adding disabled)."));
+                }
                 let keypair = generate_keypair()?;
                 let dev = Mullvad::upload_wg_key(&client, &auth.access_token, &keypair)?;
-
-           // Save keypair
-            let path = self.wireguard_dir()?.join("wireguard_device.json");
-            {
-                let mut f = std::fs::File::create(path.clone())?;
-                write!(f, "{}", serde_json::to_string(&PrivateDevice::from_device(&dev, &keypair.private))?)?;
+                let private_device_info = PrivateDevice::from_device(&dev, &keypair.private);
+                {
+                    let mut f = std::fs::File::create(&wg_device_path)?;
+                    write!(f, "{}", serde_json::to_string(&private_device_info)?)?;
+                }
+                info!("Saved new Wireguard keypair details to {}", wg_device_path.display());
+                Ok((keypair, IpNet::from_str(&dev.ipv4_address)?, IpNet::from_str(&dev.ipv6_address)?))
+            } else {
+                Err(anyhow!("Wireguard requires a keypair. Either upload one to Mullvad or let vopono generate one."))
             }
-            info!("Saved Wireguard keypair details to {}", &path.to_string_lossy());
-
-                Ok((keypair, IpNet::from_str(&dev.ipv4_address).expect("Invalid IPv4 address"), IpNet::from_str(&dev.ipv6_address).expect("Invalid IPv6 address")))
-        } else {
-            Err(anyhow!("Wireguard requires a keypair, either upload one to Mullvad or let vopono generate one"))
-    }
-        } else {
+        } else { // Manual key entry
             let manual_dev = get_manually_entered_keypair(uiclient)?;
-            // Save keypair
-            let path = self.wireguard_dir()?.join("wireguard_device.json");
+            let private_device_info = PrivateDevice {
+                public_key: manual_dev.0.public.clone(),
+                private_key: manual_dev.0.private.clone(),
+                ipv4_address: manual_dev.1.to_string(),
+                ipv6_address: manual_dev.2.to_string(),
+            };
             {
-                let mut f = std::fs::File::create(path.clone())?;
-                write!(
-                    f,
-                    "{}",
-                    serde_json::to_string(&PrivateDevice {
-                        public_key: manual_dev.0.public.clone(),
-                        private_key: manual_dev.0.private.clone(),
-                        ipv4_address: manual_dev.1.to_string(),
-                        ipv6_address: manual_dev.2.to_string()
-                    })?
-                )?;
+                let mut f = std::fs::File::create(&wg_device_path)?;
+                write!(f, "{}", serde_json::to_string(&private_device_info)?)?;
             }
-            info!(
-                "Saved Wireguard keypair details to {}",
-                &path.to_string_lossy()
-            );
+            info!("Saved Wireguard keypair details to {}", wg_device_path.display());
             Ok(manual_dev)
         }
     }

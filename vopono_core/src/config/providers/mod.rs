@@ -9,6 +9,9 @@ pub mod pia;
 mod protonvpn;
 mod ui;
 mod warp;
+mod non_interactive_ui_client;
+#[cfg(test)]
+mod non_interactive_ui_client_tests;
 
 use crate::config::vpn::Protocol;
 use crate::util::vopono_dir;
@@ -23,6 +26,7 @@ use std::{
 use strum_macros::{Display, EnumIter};
 // TODO: Consider removing this re-export
 pub use ui::*;
+pub use non_interactive_ui_client::*;
 
 // Command-line arguments use VpnProvider enum
 // We pattern match on that to build an instance of the actual provider struct
